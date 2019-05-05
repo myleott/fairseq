@@ -338,6 +338,9 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             return _Writer()
 
         def __init__(self, path, warmup=True):
+            self.path = path
+            self.warmup = warmup
+
             with open(path, 'rb') as stream:
                 magic_test = stream.read(9)
                 assert self._HDR_MAGIC == magic_test
@@ -349,17 +352,31 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                 self._dtype_size = self._dtype().itemsize
 
                 self._len = struct.unpack('<Q', stream.read(8))[0]
-                offset = stream.tell()
+                self.offset = stream.tell()
 
-            self._bin_buffer = memoryview(np.memmap(path, mode='r', order='C'))
+            _bin_buffer = memoryview(np.memmap(self.path, mode='r', order='C'))
+            self._sizes = np.copy(
+                np.frombuffer(
+                    _bin_buffer, dtype=np.int32, count=self._len,
+                    offset=self.offset,
+                )
+            )
 
-            if warmup:
-                for _ in self._bin_buffer:
-                    pass
+            self._bin_buffer = None
+            self._pointers = None
 
-            self._sizes = np.frombuffer(self._bin_buffer, dtype=np.int32, count=self._len, offset=offset)
-            self._pointers = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._len,
-                                           offset=offset + self._sizes.nbytes)
+        def _init(self):
+            if not self._bin_buffer:
+                self._bin_buffer = memoryview(np.memmap(self.path, mode='r', order='C'))
+
+                if self.warmup:
+                    for _ in self._bin_buffer:
+                        pass
+
+                self._pointers = np.frombuffer(
+                    self._bin_buffer, dtype=np.int64, count=self._len,
+                    offset=self.offset + self._sizes.nbytes,
+                )
 
         @property
         def dtype(self):
@@ -370,6 +387,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             return self._sizes
 
         def __getitem__(self, i):
+            self._init()
             return self._pointers[i], self._sizes[i]
 
         def __len__(self):
@@ -377,19 +395,26 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
     def __init__(self, path, warmup=True):
         super().__init__()
+        self.path = path
+        self.warmup = warmup
 
         self._index = self.Index(index_file_path(path), warmup=warmup)
         self._dtype = self._index.dtype
-        self._bin_buffer = memoryview(np.memmap(data_file_path(path), mode='r', order='C'))
+        self._bin_buffer = None
 
-        if warmup:
-            for _ in self._bin_buffer:
-                pass
+    def _init(self):
+        if not self._bin_buffer:
+            self._bin_buffer = memoryview(np.memmap(data_file_path(self.path), mode='r', order='C'))
+
+            if self.warmup:
+                for _ in self._bin_buffer:
+                    pass
 
     def __len__(self):
         return len(self._index)
 
     def __getitem__(self, i):
+        self._init()
         ptr, size = self._index[i]
         tensor = torch.from_numpy(np.frombuffer(self._bin_buffer, dtype=self._dtype, count=size, offset=ptr))
         if self._dtype == np.int64:
